@@ -1,197 +1,136 @@
-# Bipedal Stair-Climbing — MuJoCo + ZeroMQ
+# Двуногий робот — подъём по лестнице
 
-A 2-D bipedal robot that walks on flat ground and climbs a 5-step staircase,
-simulated in **MuJoCo 3** and controlled by a **Central Pattern Generator (CPG)**
-over a **ZeroMQ** message bus.
+Проект в рамках предмета "Программирование роботов". 
+Выполнили Максина Ксения, Шульга Ирина, Щерблюк Елизавета.
+Двуногий робот в 2D-симуляции самостоятельно идёт по плоскости, поднимается по лестнице с 5 ступеньками и останавливается на платформе.
 
-![simulation](examples/bipedal_stairs/sim/preview.gif)
-
----
-
-## Assignment checklist
-
-| Requirement | Status | Details |
-|---|---|---|
-| Simulator scene | ✅ | MuJoCo 3, `bipedal_robot.xml` |
-| 3 DOF frozen → 2-D system | ✅ | `slide_y`, `hinge_x`, `hinge_z` absent; only `slide_x`, `slide_z`, `hinge_y` |
-| Non-PD/PID controller | ✅ | CPG (Central Pattern Generator) with torso-pitch feedback |
-| External communication protocol | ✅ | ZeroMQ PUSH/PULL over TCP |
-| Repository structure | ✅ | `pyproject.toml`, CI, tests, pre-commit |
+**Стек:** MuJoCo 3, ZeroMQ, NumPy, Python 3.10+
 
 ---
 
-## Architecture
+## Что умеет робот
 
-```
-┌─────────────────────────────┐        ZeroMQ TCP        ┌────────────────────────────┐
-│        SimulatorNode        │                          │      ControllerNode        │
-│      (sim/sim_node.py)      │                          │   (control/ctrl_node.py)   │
-│                             │                          │                            │
-│  MuJoCo physics (500 Hz)    │  ──obs tcp://:5555──►   │  CPG controller            │
-│                             │  ◄──cmd tcp://:5556──   │  + torso-pitch feedback    │
-└─────────────────────────────┘                          └────────────────────────────┘
-```
-
-**Message format (JSON over ZeroMQ)**
-
-| Direction | Port | Payload |
-|---|---|---|
-| sim → ctrl | 5555 | `{"t": float, "qpos": [9], "qvel": [9]}` |
-| ctrl → sim | 5556 | `{"ctrl": [6]}` |
-
-The nodes can run in the **same process** (threads) or as **separate OS processes**
-on the same machine or over a network — just change `OBS_ADDR` / `CMD_ADDR`
-in `communication/zmq_transport.py`.
+- Ходит по плоскости с нарастающей амплитудой
+- Поднимается по лестнице (5 ступенек, высота 13 см каждая)
+- Переходит на платформу и фиксируется в финальной стойке
 
 ---
 
-## Robot model
+## Архитектура
+
+Система состоит из двух узлов, которые общаются через ZeroMQ:
 
 ```
-torso  (slide_x, slide_z, hinge_y)
-├── left_hip  → left_knee  → left_ankle   [hip, knee, ankle pitch]
-└── right_hip → right_knee → right_ankle  [hip, knee, ankle pitch]
+SimulatorNode  ──obs──►  ControllerNode
+               ◄──cmd──
 ```
 
-**Degrees of freedom**: 3 rigid-body DOF + 6 joint DOF = 9 total  
-**2-D constraint**: Y translation and X/Z rotations are absent from the model,
-so the robot moves only in the X–Z plane.
+- **SimulatorNode** — запускает физику в MuJoCo, отправляет текущее состояние робота (позиции и скорости суставов)
+- **ControllerNode** — получает состояние, считает CPG и отправляет обратно 6 целевых углов
 
-**Staircase**: 5 steps, tread = 0.42 m, riser = 0.13 m → total rise = 0.65 m
+Узлы можно запускать как в одном процессе, так и в разных.
 
 ---
 
-## Controller: CPG (Central Pattern Generator)
+## Контроллер: CPG
 
-The CPG produces smooth, rhythmic joint commands without any PID loop:
+Вместо классического PID реализован **Central Pattern Generator (CPG)** — алгоритм, который задаёт ритмичные синусоидальные сигналы для каждого сустава. Он имитирует то, как нервная система животных генерирует походку без явного расчёта траектории.
 
-```
-phase += 2π · freq · dt          # accumulating phase (continuous clock)
-
-left_hip  =  A · sin(phase)      # anti-phase legs
-right_hip = -A · sin(phase)
-
-left_knee  = -(b + C · max(0, cos(phase))^1.2)   # clearance at liftoff
-right_knee = -(b + C · max(0, -cos(phase))^1.2)
-
-left_ankle  =  D · sin(phase + φ)
-right_ankle = -D · sin(phase + φ)
-```
-
-**Adaptation on stairs**
-
-| Parameter | Flat ground | Stairs (step 5) |
-|---|---|---|
-| Frequency | 0.62 Hz | 0.48 Hz |
-| Hip amplitude A | 0.52 rad | 0.66 rad |
-| Ankle amplitude D | 0.12 rad | 0.29 rad |
-| Knee clearance C | 0.46 rad | 0.64 rad |
-
-The ankle amplitude is blended from flat (0.12 rad — nearly flat foot) to stair
-propulsion (0.22 + 0.07·sf₁ rad) as the robot enters the staircase.  This gives
-deliberate, visible foot placement on each step (~1 s/step) instead of rushing
-through at high speed.
-
-**Stability features**
-- *Torso-pitch feedback*: `Δhip = 0.5 · θ_torso` — resists forward/backward lean
-- *Velocity balance*: `Δhip = −0.25 · ẋ` — damps CoM oscillations
-- *Landing taper*: all amplitudes fade to zero once the robot is on the platform
-- *Stiff torso*: hinge_y stiffness=9000 Nm/rad, damping=160 Nm·s/rad (was 6000/120)
+На лестнице параметры автоматически адаптируются: частота шага снижается, амплитуда бедра и голеностопа растут — чтобы робот делал более высокие и чёткие шаги.
 
 ---
 
-## Installation
+## Модель робота
+
+```
+torso
+├── left_hip → left_knee → left_ankle
+└── right_hip → right_knee → right_ankle
+```
+
+- 9 степеней свободы: 3 у торса + по 3 на каждую ногу
+- Движение только в плоскости X-Z (2D)
+- Торс намеренно жёсткий — чтобы не было бокового раскачивания
+- Лестница: 5 ступенек, глубина 42 см, высота 13 см
+
+---
+
+## Установка
 
 ```bash
-# Clone / enter repo
-git clone <repo-url> && cd bipedal-stairs
+git clone https://github.com/ShulgaID/TEAM12.git
+cd TEAM12
 
-# Install with uv (recommended)
+# через uv
 uv pip install ".[dev]"
 
-# Or with pip
+# или через pip
 pip install ".[dev]"
 ```
 
-**Dependencies**: `mujoco>=3.0`, `numpy`, `pyzmq`, `imageio[ffmpeg]`
-
 ---
 
-## Running
+## Запуск
 
-### All-in-one (simulator + controller in one command)
+### Всё в одной команде
 
 ```bash
-python -m examples.bipedal_stairs.run             # 10 000 steps (20 s)
-python -m examples.bipedal_stairs.run --steps 6000
+python -m examples.bipedal_stairs.run
 ```
 
-### Two separate processes (shows external protocol clearly)
+### Два отдельных процесса (показывает работу протокола)
 
 ```bash
-# Terminal 1 — controller (start first)
+# Терминал 1 — контроллер (запустить первым)
 python -m examples.bipedal_stairs.control.ctrl_node
 
-# Terminal 2 — simulator
-python -m examples.bipedal_stairs.sim.sim_node --steps 6000
+# Терминал 2 — симулятор
+python -m examples.bipedal_stairs.sim.sim_node
 ```
 
-### Record video
+### Запись видео
 
 ```bash
-xvfb-run python record_sim.py     # Linux headless
-python record_sim.py              # Windows / macOS with display
+# Linux (без дисплея)
+xvfb-run python record_sim.py
+
+# Windows / macOS
+python record_sim.py
 ```
 
-Output: `simulation_mujoco.mp4` (1280×720, 10 s)
+Видео сохраняется как `simulation_mujoco.mp4`.
 
 ---
 
-## Tests
+## Тесты
 
 ```bash
-pytest                   # all tests
-pytest -v tests/         # verbose
+pytest
 ```
 
-Test coverage:
+Что тестируется:
+- `tests/test_cpg_controller.py` — корректность выходных сигналов CPG, ограничения суставов, адаптация на лестнице
+- `tests/test_zmq_transport.py` — передача сообщений через ZeroMQ
 
-- `tests/test_cpg_controller.py` — output shape, joint limits, stair factor, landing taper, reset
-- `tests/test_zmq_transport.py`  — ZeroMQ round-trip (single message, field correctness, timeout)
+CI запускается автоматически при каждом коммите через GitHub Actions (Python 3.10–3.12, pytest, ruff).
 
 ---
 
-## Repository structure
+## Структура репозитория
 
 ```
-bipedal-stairs/
+TEAM12/
 ├── examples/bipedal_stairs/
-│   ├── run.py                        ← main entry point (two-thread mode)
 │   ├── communication/
-│   │   ├── zmq_transport.py          ← ZeroMQ PUSH/PULL layer  ★
-│   │   └── layer.py                  ← legacy in-process queue (reference)
+│   │   └── zmq_transport.py      ← ZeroMQ протокол
 │   ├── sim/
-│   │   ├── sim_node.py               ← simulator thread / process
-│   │   ├── environment.py            ← MuJoCo environment wrapper
-│   │   └── bipedal_robot.xml         ← robot + staircase model
+│   │   ├── environment.py        ← обёртка над MuJoCo
+│   │   ├── sim_node.py           ← узел симулятора
+│   │   └── bipedal_robot.xml     ← модель робота и лестница
 │   └── control/
-│       ├── ctrl_node.py              ← controller thread / process
-│       ├── cpg_controller.py         ← CPG gait algorithm  ★
-│       └── stair_controller.py       ← FSM reference (not used in default run)
+│       ├── cpg_controller.py     ← алгоритм CPG
+│       └── ctrl_node.py          ← узел контроллера
 ├── tests/
-│   ├── test_cpg_controller.py
-│   └── test_zmq_transport.py
-├── record_sim.py                     ← standalone video recorder
-├── pyproject.toml
-├── noxfile.py
-└── .github/workflows/ci.yaml
+├── record_sim.py                 ← запись видео
+└── pyproject.toml
 ```
-
----
-
-## CI
-
-GitHub Actions runs on every push/PR:
-- Python 3.10, 3.11, 3.12
-- `pytest tests/` (headless, no GPU required)
-- `ruff check` + `ruff format --check`
